@@ -1,11 +1,13 @@
 import { coerceErrorMessage, toErrorObject } from "openclaw/plugin-sdk/error-runtime";
-import { resolveFetch } from "openclaw/plugin-sdk/fetch-runtime";
+import { captureEffectAuthority, resolveFetch } from "openclaw/plugin-sdk/fetch-runtime";
 import {
   detectMime,
   extractOriginalFilename,
   parseMediaContentLength,
 } from "openclaw/plugin-sdk/media-runtime";
 import {
+  asNonNegativeFiniteNumber,
+  asPositiveFiniteNumber,
   parseStrictNonNegativeInteger,
   resolvePositiveTimerTimeoutMs,
   resolveTimerTimeoutMs,
@@ -110,13 +112,6 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   return await withSignalRestDeadline(timeoutMs, async ({ signal }) =>
     fetchImpl(url, { ...init, signal }),
   );
-}
-
-function normalizeMaxResponseBytes(value: number | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return DEFAULT_ATTACHMENT_RESPONSE_MAX_BYTES;
-  }
-  return Math.floor(value);
 }
 
 function signalRestIdleTimeoutError({ chunkTimeoutMs }: { chunkTimeoutMs: number }): Error {
@@ -281,6 +276,7 @@ async function containerRestRequest<T = unknown>(
   method: "GET" | "POST" | "PUT" | "DELETE" = "GET",
   body?: unknown,
 ): Promise<T> {
+  const effect = captureEffectAuthority();
   const baseUrl = normalizeBaseUrl(opts.baseUrl);
   const url = `${baseUrl}${endpoint}`;
 
@@ -301,8 +297,10 @@ async function containerRestRequest<T = unknown>(
   }
 
   return await withSignalRestDeadline(timeoutMs, async ({ signal, timeoutMs: bodyTimeoutMs }) => {
-    opts.assertDirectAdapterHandoff?.();
-    const res = await fetchImpl(url, { ...init, signal });
+    const res = await effect.initiate(() => {
+      opts.assertDirectAdapterHandoff?.();
+      return fetchImpl(url, { ...init, signal });
+    });
     if (res.status === 204) {
       return undefined as T;
     }
@@ -364,7 +362,9 @@ async function containerFetchAttachment(
 
       return await readCappedResponseBuffer(
         fetched,
-        normalizeMaxResponseBytes(opts.maxResponseBytes),
+        Math.floor(
+          asPositiveFiniteNumber(opts.maxResponseBytes) ?? DEFAULT_ATTACHMENT_RESPONSE_MAX_BYTES,
+        ),
         bodyIdleTimeoutMs,
         bodyTimeoutMs,
       );
@@ -667,13 +667,10 @@ export async function containerRpcRequest<T = unknown>(
       const attachments = p.attachments as string[] | undefined;
       if (attachments?.length) {
         // Container API only accepts base64-encoded attachments, not file paths.
-        const configuredMaxBytes = opts.maxAttachmentBytes;
-        const maxAttachmentBytes =
-          typeof configuredMaxBytes === "number" &&
-          Number.isFinite(configuredMaxBytes) &&
-          configuredMaxBytes >= 0
-            ? Math.floor(configuredMaxBytes)
-            : DEFAULT_SIGNAL_CONTAINER_MAX_ATTACHMENT_BYTES;
+        const maxAttachmentBytes = Math.floor(
+          asNonNegativeFiniteNumber(opts.maxAttachmentBytes) ??
+            DEFAULT_SIGNAL_CONTAINER_MAX_ATTACHMENT_BYTES,
+        );
         payload.base64_attachments = await filesToBase64DataUris(attachments, maxAttachmentBytes);
       }
       const quoteTimestamp = parseStrictNonNegativeInteger(
@@ -754,7 +751,6 @@ export async function containerRpcRequest<T = unknown>(
         timeoutMs: opts.timeoutMs,
         maxResponseBytes: opts.maxResponseBytes,
       });
-      // Convert to native format: { data: base64String }
       if (!buffer) {
         return { data: undefined } as T;
       }

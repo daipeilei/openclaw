@@ -238,7 +238,3 @@ extensions/discord/assets/embedded-app-sdk.mjs
 
 # Pinned Swift lint/format tools installed by scripts/install-swift-tools.sh
 .build/
-
-# local tooling scratch (not part of PR)
-.node24/
-.reconcile/

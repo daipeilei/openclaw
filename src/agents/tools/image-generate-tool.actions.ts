@@ -18,7 +18,7 @@ import {
 
 function formatImageGenerationAuthHint(provider: { id: string }): string | undefined {
   return provider.id === "openai"
-    ? "set OPENAI_API_KEY or configure OpenAI Codex OAuth for openai/gpt-image-2"
+    ? "set OPENAI_API_KEY or configure an OpenClaw Codex login OAuth profile (not SIWC) for openai/gpt-image-2"
     : undefined;
 }
 
@@ -67,6 +67,7 @@ export function createImageGenerateListActionResult(params: {
   workspaceDir?: string;
   agentDir?: string;
   authStore?: AuthProfileStore;
+  authProfileStoreSource?: boolean;
 }): MediaGenerateActionResult {
   return createMediaGenerateProviderListActionResult({
     kind: "image_generation",
@@ -76,6 +77,7 @@ export function createImageGenerateListActionResult(params: {
     workspaceDir: params.workspaceDir,
     agentDir: params.agentDir,
     authStore: params.authStore,
+    authProfileStoreSource: params.authProfileStoreSource,
     listModes: listSupportedImageGenerationModes,
     summarizeCapabilities: summarizeImageGenerationCapabilities,
     formatAuthHint: formatImageGenerationAuthHint,

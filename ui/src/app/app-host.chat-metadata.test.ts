@@ -449,7 +449,13 @@ describe.each(["auth", "catalog"] as const)("%s read lifecycle", (kind) => {
     const fresh = createDeferred<ModelAuthStatusResult | ModelCatalogResult>();
     const { gateway, current } = createGatewayStoreTestStore();
     gateway.start();
-    current().opts.onHello?.(gatewayHelloForMethods([]));
+    const hello = {
+      ...gatewayHelloForMethods([]),
+      snapshot: {
+        presence: [{ instanceId: current().instanceId, user: { id: "original" } }],
+      },
+    };
+    current().opts.onHello?.(hello);
     const request = current()
       .request.mockImplementationOnce(() => stale.promise)
       .mockImplementation(() => fresh.promise);
@@ -478,9 +484,9 @@ describe.each(["auth", "catalog"] as const)("%s read lifecycle", (kind) => {
     const before = read().catch((error: unknown) => error);
     if (transition === "same-client reconnect") {
       current().opts.onClose?.({ code: 1006, reason: "reconnect", willRetry: true });
-      current().opts.onHello?.(gatewayHelloForMethods([]));
+      current().opts.onHello?.({ ...hello });
     } else if (transition === "same-client hello") {
-      current().opts.onHello?.(gatewayHelloForMethods([]));
+      current().opts.onHello?.({ ...hello });
     } else if (transition === "same-client identity") {
       current().opts.onEvent?.({
         type: "event",
@@ -541,6 +547,7 @@ it("rebinds global chat metadata immediately on agent selection and follows late
       expect(request).toHaveBeenCalledWith("chat.metadata", {
         agentId: "main",
         sessionKey: "global",
+        includeModels: false,
       }),
     );
     ready = true;
@@ -678,6 +685,7 @@ describe.each(["command-metadata", "patch", "reset"])("session metadata event %s
         expect(request.mock.calls.findLast(([method]) => method === "chat.metadata")?.[1]).toEqual({
           agentId,
           sessionKey: key,
+          includeModels: false,
         });
         expect(request.mock.calls.filter(([method]) => method === "models.list")).toHaveLength(
           catalogsBefore + 1,

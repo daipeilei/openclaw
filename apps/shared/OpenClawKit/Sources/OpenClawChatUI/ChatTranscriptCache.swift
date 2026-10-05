@@ -80,6 +80,8 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
         return String(lastError[..<marker.lowerBound])
     }
 
+    private var sendOwnership: OpenClawChatSendOwnership?
+    private var pendingEnqueues = 0
     private let databases: OpenClawClientDatabases
     public nonisolated let gatewayID: String
     private var isRetired = false
@@ -140,12 +142,6 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
                         "gateway session cache decode failed: \(error.localizedDescription, privacy: .public)")
                     // Decode and cleanup share one agent partition transaction;
                     // corruption in one roster must not erase another agent.
-                    try db.execute(
-                        sql: """
-                        DELETE FROM cached_agent_sessions
-                        WHERE gateway_id = ? AND agent_id = ?
-                        """,
-                        arguments: [gatewayID, normalizedAgentID])
                     try db.execute(
                         sql: """
                         DELETE FROM cached_session_rosters
@@ -215,7 +211,7 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
             cacheLogger.error("gateway session cache rejected a mixed-agent snapshot")
             return
         }
-        let bounded = Self.boundedSessions(owned)
+        let bounded = Self.boundedSessions(owned).map(Self.sessionCacheProjection)
         let gatewayID = self.gatewayID
         do {
             let encoded = try bounded.map(Self.encodeJSON)
@@ -255,29 +251,17 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
                             pair.1,
                         ])
                 }
-                let staleOwners = try String.fetchAll(
-                    db,
+                try db.execute(
                     sql: """
-                    SELECT agent_id FROM cached_session_rosters
-                    WHERE gateway_id = ?
-                    ORDER BY last_used_at DESC, agent_id
-                    LIMIT -1 OFFSET ?
+                    DELETE FROM cached_session_rosters
+                    WHERE rowid IN (
+                        SELECT rowid FROM cached_session_rosters
+                        WHERE gateway_id = ?
+                        ORDER BY last_used_at DESC, agent_id
+                        LIMIT -1 OFFSET ?
+                    )
                     """,
                     arguments: [gatewayID, Self.maxCachedSessionOwners])
-                for staleOwner in staleOwners {
-                    try db.execute(
-                        sql: """
-                        DELETE FROM cached_agent_sessions
-                        WHERE gateway_id = ? AND agent_id = ?
-                        """,
-                        arguments: [gatewayID, staleOwner])
-                    try db.execute(
-                        sql: """
-                        DELETE FROM cached_session_rosters
-                        WHERE gateway_id = ? AND agent_id = ?
-                        """,
-                        arguments: [gatewayID, staleOwner])
-                }
             }
         } catch {
             cacheLogger.error("gateway session cache write failed: \(error.localizedDescription, privacy: .public)")
@@ -301,7 +285,21 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
             else { return true }
             return canonicalMessageIdempotencyKeys.contains(key)
         }
-        await writeTranscript(sessionKey: sessionKey, agentID: agentID, messages: canonicalOnly)
+        guard !self.isRetired else { return }
+        let normalizedAgentID = Self.normalizedAgentID(agentID)
+        let gatewayID = self.gatewayID
+        do {
+            try await self.databases.cacheQueue.write { db in
+                try Self.replaceTranscript(
+                    db,
+                    gatewayID: gatewayID,
+                    sessionKey: sessionKey,
+                    agentID: normalizedAgentID,
+                    messages: canonicalOnly)
+            }
+        } catch {
+            cacheLogger.error("gateway transcript cache write failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     public func mergeCanonicalTranscriptMessage(
@@ -400,28 +398,6 @@ public actor OpenClawChatSQLiteTranscriptCache: OpenClawChatTranscriptCache,
 }
 
 extension OpenClawChatSQLiteTranscriptCache {
-    private func writeTranscript(
-        sessionKey: String,
-        agentID: String?,
-        messages: [OpenClawChatMessage]) async
-    {
-        guard !self.isRetired else { return }
-        let normalizedAgentID = Self.normalizedAgentID(agentID)
-        let gatewayID = self.gatewayID
-        do {
-            try await self.databases.cacheQueue.write { db in
-                try Self.replaceTranscript(
-                    db,
-                    gatewayID: gatewayID,
-                    sessionKey: sessionKey,
-                    agentID: normalizedAgentID,
-                    messages: messages)
-            }
-        } catch {
-            cacheLogger.error("gateway transcript cache write failed: \(error.localizedDescription, privacy: .public)")
-        }
-    }
-
     private nonisolated static func replaceTranscript(
         _ db: Database,
         gatewayID: String,
@@ -462,25 +438,17 @@ extension OpenClawChatSQLiteTranscriptCache {
                     pair.1,
                 ])
         }
-        let stale = try Row.fetchAll(
-            db,
+        try db.execute(
             sql: """
-            SELECT session_key, agent_id FROM cached_transcripts
-            WHERE gateway_id = ?
-            ORDER BY updated_at DESC, rowid DESC
-            LIMIT -1 OFFSET \(self.maxCachedTranscripts)
+            DELETE FROM cached_transcripts
+            WHERE rowid IN (
+                SELECT rowid FROM cached_transcripts
+                WHERE gateway_id = ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
+            )
             """,
-            arguments: [gatewayID])
-        for row in stale {
-            let staleSessionKey: String = row["session_key"]
-            let staleAgentID: String = row["agent_id"]
-            try db.execute(
-                sql: """
-                DELETE FROM cached_transcripts
-                WHERE gateway_id = ? AND session_key = ? AND agent_id = ?
-                """,
-                arguments: [gatewayID, staleSessionKey, staleAgentID])
-        }
+            arguments: [gatewayID, self.maxCachedTranscripts])
     }
 }
 
@@ -491,7 +459,37 @@ extension OpenClawChatSQLiteTranscriptCache {
         self.storeChangeHub.stream()
     }
 
+    public func reserveWebConversation(
+        scope: OpenClawChatSendOwnership.Scope, owner: UUID, ownership: OpenClawChatSendOwnership) async -> Bool
+    {
+        guard !self.isRetired, self.pendingEnqueues == 0,
+              self.sendOwnership == nil || self.sendOwnership === ownership else { return false }
+        self.sendOwnership = ownership
+        guard ownership.beginWeb(scope, owner: owner) else { return false }
+        // Reserve admission before the database read so an enqueue cannot cross cutover.
+        guard let commands = await self.loadCommandsIfAvailable() else {
+            ownership.endWeb(scope, owner: owner)
+            return false
+        }
+        guard !commands.contains(where: {
+            OpenClawChatSendOwnership.Scope(
+                sessionKey: $0.deliverySessionKey, agentID: $0.agentID, routingContract: $0.routingContract) == scope
+        }) else {
+            ownership.endWeb(scope, owner: owner)
+            return false
+        }
+        return true
+    }
+
     public func enqueueCommand(_ command: OpenClawChatOutboxCommand) async -> Bool {
+        let scope = OpenClawChatSendOwnership.Scope(
+            sessionKey: command.deliverySessionKey, agentID: command.agentID, routingContract: command.routingContract)
+        let ownership = self.sendOwnership
+        guard ownership?.beginNative(scope) != false else { return false }
+        self.pendingEnqueues += 1
+        defer { self.pendingEnqueues -= 1
+            ownership?.endNative(scope)
+        }
         guard !self.isRetired,
               let attachmentByteCount = Self.attachmentByteCount(command.attachments),
               Self.canEnqueueAttachmentBytes(commandBytes: attachmentByteCount, queuedBytes: 0)
@@ -746,8 +744,7 @@ extension OpenClawChatSQLiteTranscriptCache {
                 let hadUnacknowledgedSend: Int = row["had_unacknowledged_send"]
                 let wasPossiblyAccepted = wasBranchParked &&
                     (parkedWasAccepted != 0 || hadUnacknowledgedSend != 0)
-                let normalizedReplacementID = replacementID?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let nextID = normalizedReplacementID?.isEmpty == false ? normalizedReplacementID! : UUID().uuidString
+                let nextID = replacementID?.trimmedNonEmpty ?? UUID().uuidString
                 let updateID = wasPossiblyAccepted ? nextID : id
                 try db.execute(
                     sql: """

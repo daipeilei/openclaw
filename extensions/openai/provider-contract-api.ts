@@ -4,6 +4,7 @@ import {
   asNonArrayRecord,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveFastModeSupport, resolveServiceTiers } from "./provider-policy-api.js";
 import { isSIWCAuthFlow } from "./token-sharing.js";
 
 const noopAuth = async () => ({ profiles: [] });
@@ -88,6 +89,8 @@ export function createOpenAIProvider(): ProviderPlugin {
     hookAliases: ["azure-openai", "azure-openai-responses"],
     docsPath: "/providers/models",
     envVars: ["OPENAI_API_KEY"],
+    resolveFastModeSupport,
+    resolveServiceTiers,
     auth: [
       {
         id: "oauth",
@@ -126,14 +129,14 @@ export function createOpenAIProvider(): ProviderPlugin {
         id: "siwc",
         kind: "oauth",
         label: "Sign in with ChatGPT (Beta)",
-        hint: "Use your Codex allowance with per-instance usage tracking and token limits",
+        hint: "Authorize OpenClaw for eligible Responses models using your Codex allowance",
         run: noopAuth,
         matchesPersonalAccount: matchesTokenSharingAccount,
         wizard: {
           choiceId: "openai-token-sharing",
           choiceLabel: "Sign in with ChatGPT (Beta)",
-          choiceHint: "Use your Codex allowance with per-instance usage tracking and token limits",
-          assistantPriority: -50,
+          choiceHint: "Authorize OpenClaw for eligible Responses models using your Codex allowance",
+          assistantPriority: 0,
           ...OPENAI_ACCOUNT_WIZARD_GROUP,
         },
       },

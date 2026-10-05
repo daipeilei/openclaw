@@ -165,15 +165,7 @@ func normalizeMaskedListMarkerSpacing(source, translated string, listPlaceholder
 }
 
 func markdownWhitespaceRunStart(text string, position int) int {
-	for position > 0 {
-		switch text[position-1] {
-		case ' ', '\t', '\r', '\n':
-			position--
-		default:
-			return position
-		}
-	}
-	return position
+	return len(strings.TrimRight(text[:position], " \t\r\n"))
 }
 
 func escapeUnexpectedListItemBodyMarkers(source, translated string, listPlaceholders map[string]string) string {
@@ -246,9 +238,6 @@ func escapeUnexpectedMarkdownListMarkers(text string, listPlaceholders map[strin
 func protectedMarkdownLinkRanges(text string) [][2]int {
 	ranges := make([][2]int, 0)
 	for _, match := range linkLabelRe.FindAllStringSubmatchIndex(text, -1) {
-		if len(match) < 6 {
-			continue
-		}
 		label := text[match[2]:match[3]]
 		destination := markdownInlineLinkDestination(text[match[4]:match[5]])
 		if isProtectedProductLinkLabel(label, destination) {

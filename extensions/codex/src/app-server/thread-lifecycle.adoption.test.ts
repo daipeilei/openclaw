@@ -1,8 +1,8 @@
 import path from "node:path";
 import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { upsertSessionEntry, patchSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
-import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useSessionStoreTempDirs } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   consumeCodexAppServerLiveThread,
   ensureCodexAppServerClientRuntime,
@@ -23,7 +23,7 @@ import {
   startOrResumeThread,
 } from "./thread-lifecycle.test-fixtures.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const tempDirs = useSessionStoreTempDirs(afterAll, "openclaw-codex-thread-adoption-");
 let tempDir: string;
 
 function threadStartResult(threadId = "thread-1") {
@@ -34,7 +34,6 @@ function createThreadLifecycleAppServerOptions(): ReturnType<typeof createAppSer
   return {
     ...createAppServerOptions(),
     connectionClass: "local-loopback",
-    remoteAppsSubstrate: "preconfigured",
   };
 }
 
@@ -86,7 +85,7 @@ async function seedAdoptedThreadBinding(params: EmbeddedRunAttemptParams, cwd: s
 
 describe("Codex app-server adopted thread lifecycle", () => {
   beforeEach(() => {
-    tempDir = tempDirs.make("openclaw-codex-thread-adoption-");
+    tempDir = tempDirs.make();
     resetCodexTestBindingStore();
   });
 

@@ -1,4 +1,3 @@
-// Manual transcript trimming and model-backed session compaction.
 import { randomUUID } from "node:crypto";
 import {
   ErrorCodes,
@@ -36,7 +35,7 @@ import {
   resolveCanonicalGatewaySessionStoreKey,
   resolveGatewaySessionStoreTargetWithStore,
 } from "../session-utils.js";
-import { asWorkerInferenceControl } from "../worker-environments/inference-control.js";
+import { getWorkerInferenceSessionControl } from "../worker-environments/inference-control-internal.js";
 import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
@@ -122,11 +121,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
         project: ({ existingEntry }) =>
           existingEntry ? { ok: true, entry: existingEntry } : { ok: false },
       });
-      const compactTarget = {
-        entry: compactRead.ok ? compactRead.entry : undefined,
-        primaryKey: compactPrimaryKey,
-      };
-      const entry = compactTarget.entry;
+      const entry = compactRead.ok ? compactRead.entry : undefined;
       const sessionId = entry?.sessionId;
       const respondNotCompacted = (details: { ok?: boolean; kept?: number; reason?: string }) => {
         respond(
@@ -136,20 +131,27 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
         );
       };
       if (!sessionId) {
-        respondNotCompacted({ reason: "no sessionId" });
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `Session ${key} not found. Run openclaw sessions list --json to choose a valid key.`,
+          ),
+        );
         return;
       }
+      const transcriptScope = {
+        agentId: target.agentId,
+        sessionId,
+        sessionKey: compactPrimaryKey,
+        storePath,
+      };
 
       if (maxLines !== undefined) {
-        const trimPreflight = await preflightSessionTranscriptForManualCompact(
-          {
-            sessionId,
-            storePath,
-            sessionKey: compactTarget.primaryKey,
-            agentId: target.agentId,
-          },
-          { maxLines },
-        );
+        const trimPreflight = await preflightSessionTranscriptForManualCompact(transcriptScope, {
+          maxLines,
+        });
         if (!trimPreflight.compacted) {
           respondNotCompacted(
             "kept" in trimPreflight ? { kept: trimPreflight.kept } : { reason: "no transcript" },
@@ -157,12 +159,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
           return;
         }
       } else {
-        const transcriptStats = readTranscriptStatsSync({
-          agentId: target.agentId,
-          sessionId,
-          sessionKey: compactTarget.primaryKey,
-          storePath,
-        });
+        const transcriptStats = readTranscriptStatsSync(transcriptScope);
         if (transcriptStats.eventCount === 0) {
           respondNotCompacted({ reason: "no transcript" });
           return;
@@ -183,13 +180,15 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
           ? latest
           : undefined;
       };
-      const queueIdentities = [key, target.canonicalKey, compactTarget.primaryKey, sessionId];
+      const queueIdentities = [key, target.canonicalKey, compactPrimaryKey, sessionId];
       const lifecycleIdentities = [...queueIdentities, lifecycleRevision];
-      let sessionStillCurrent = true;
+      const sessionChangedError = () =>
+        errorShape(ErrorCodes.INVALID_REQUEST, `Session ${key} changed before compaction. Retry.`, {
+          details: { reason: SESSION_LIFECYCLE_CHANGED_ERROR_REASON },
+        });
+      let admissionError: ReturnType<typeof errorShape> | undefined;
       let compactionNoopReason: string | undefined;
-      let blockedByActiveRun = false;
-      let blockedByQueuedWork = false;
-      await runExclusiveSessionLifecycleMutation({
+      await runExclusiveSessionLifecycleMutation("compact", {
         scope: storePath,
         identities: lifecycleIdentities,
         kind: "compaction",
@@ -198,7 +197,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
           assertRequestCurrent();
           const latestEntry = readCurrentEntry();
           if (!latestEntry) {
-            sessionStillCurrent = false;
+            admissionError = sessionChangedError();
             return;
           }
           if (maxLines === undefined) {
@@ -209,7 +208,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
                 agentId: target.agentId,
                 sessionId,
                 sessionKey: target.canonicalKey,
-                sessionStoreKey: compactTarget.primaryKey,
+                sessionStoreKey: compactPrimaryKey,
                 storePath,
               })
             )?.reason;
@@ -217,9 +216,9 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
               return;
             }
           }
-          blockedByActiveRun =
+          const blockedByActiveRun =
             isCompetingSessionWorkAdmissionActive(storePath, lifecycleIdentities) ||
-            (asWorkerInferenceControl(context.workerEnvironmentService)?.hasInferenceForSession(
+            (getWorkerInferenceSessionControl(context.workerEnvironmentService)?.hasSession(
               sessionId,
             ) ??
               false) ||
@@ -233,100 +232,59 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
             }).active;
           // Accepted work can live only in its command lane; waiting behind it
           // while holding the lifecycle fence would deadlock or drop that turn.
-          blockedByQueuedWork =
+          const blockedByQueuedWork =
             hasPendingFollowupQueueWork(queueIdentities) ||
             queueIdentities.some(
               (identity) =>
                 getCommandLaneSnapshot(resolveEmbeddedSessionLane(identity)).queuedCount > 0,
             );
+          if (blockedByQueuedWork || blockedByActiveRun) {
+            admissionError = errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `Session ${key} has ${blockedByQueuedWork ? "queued work" : "an active run"}; retry after it finishes.`,
+            );
+          }
         },
         run: async () => {
           assertRequestCurrent();
-          if (!sessionStillCurrent) {
-            respond(
-              false,
-              undefined,
-              errorShape(
-                ErrorCodes.INVALID_REQUEST,
-                `Session ${key} changed before compaction. Retry.`,
-                { details: { reason: SESSION_LIFECYCLE_CHANGED_ERROR_REASON } },
-              ),
-            );
+          if (admissionError) {
+            respond(false, undefined, admissionError);
             return;
           }
           if (compactionNoopReason) {
             respondNotCompacted({ ok: false, reason: compactionNoopReason });
             return;
           }
-          if (blockedByQueuedWork) {
-            respond(
-              false,
-              undefined,
-              errorShape(
-                ErrorCodes.INVALID_REQUEST,
-                `Session ${key} has queued work; retry after it finishes.`,
-              ),
-            );
-            return;
-          }
-          if (blockedByActiveRun) {
-            respond(
-              false,
-              undefined,
-              errorShape(
-                ErrorCodes.INVALID_REQUEST,
-                `Session ${key} has an active run; retry after it finishes.`,
-              ),
-            );
-            return;
-          }
-
           const latestEntry = readCurrentEntry();
           if (!latestEntry) {
-            respond(
-              false,
-              undefined,
-              errorShape(
-                ErrorCodes.INVALID_REQUEST,
-                `Session ${key} changed before compaction. Retry.`,
-                { details: { reason: SESSION_LIFECYCLE_CHANGED_ERROR_REASON } },
-              ),
-            );
+            respond(false, undefined, sessionChangedError());
             return;
           }
 
           const operationId = randomUUID();
           if (maxLines !== undefined) {
-            const trimResult = await trimSessionTranscriptForManualCompact(
-              {
+            const trimResult = await trimSessionTranscriptForManualCompact(transcriptScope, {
+              maxLines,
+            });
+            if (trimResult.compacted) {
+              await recordSessionCompacted({
+                sessionKey: target.canonicalKey,
+                operationId,
                 sessionId,
-                storePath,
-                sessionKey: compactTarget.primaryKey,
-                agentId: target.agentId,
-              },
-              { maxLines },
-            );
+                agentId: target.agentId ?? requestedAgentId,
+              });
+            }
             respond(
               true,
               {
                 ok: true,
                 key: target.canonicalKey,
                 compacted: trimResult.compacted,
-                ...(trimResult.compacted
-                  ? { kept: trimResult.kept }
-                  : "kept" in trimResult
-                    ? { kept: trimResult.kept }
-                    : { reason: "no transcript" }),
+                ...("kept" in trimResult ? { kept: trimResult.kept } : { reason: "no transcript" }),
               },
               undefined,
             );
             if (trimResult.compacted) {
-              recordSessionCompacted({
-                sessionKey: target.canonicalKey,
-                operationId,
-                sessionId,
-                agentId: target.agentId ?? requestedAgentId,
-              });
               emitSessionsChanged(context, {
                 sessionKey: target.canonicalKey,
                 agentId: target.agentId,
@@ -337,12 +295,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
             return;
           }
 
-          const transcriptStats = readTranscriptStatsSync({
-            agentId: target.agentId,
-            sessionId,
-            sessionKey: compactTarget.primaryKey,
-            storePath,
-          });
+          const transcriptStats = readTranscriptStatsSync(transcriptScope);
           if (transcriptStats.eventCount === 0) {
             respondNotCompacted({ reason: "no transcript" });
             return;
@@ -365,6 +318,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
               reason,
             });
           let result: Awaited<ReturnType<typeof runGatewaySessionCompaction>>;
+          let persisted = false;
           let expectedEntry: InternalSessionEntry = latestEntry;
           const assertActive = () => {
             assertRequestCurrent();
@@ -380,7 +334,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
                 agentId: target.agentId,
                 sessionId,
                 sessionKey: target.canonicalKey,
-                sessionStoreKey: compactTarget.primaryKey,
+                sessionStoreKey: compactPrimaryKey,
                 storePath,
               },
               {
@@ -391,20 +345,14 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
                 },
               },
             );
-          } catch (err) {
-            emitCompactionEnd(false, formatErrorMessage(err));
-            throw err;
-          }
-          if (result.ok && result.compacted) {
-            let persisted: boolean;
-            try {
+            if (result.ok && result.compacted) {
               // Skip terminal persistence when session ownership rotated during compaction.
               const persistProjection = await applySessionPatchProjection({
                 agentId: target.agentId,
                 assertCurrent: assertActive,
-                sessionKeys: [compactTarget.primaryKey],
+                sessionKeys: [compactPrimaryKey],
                 storePath,
-                resolveTarget: () => ({ primaryKey: compactTarget.primaryKey }),
+                resolveTarget: () => ({ primaryKey: compactPrimaryKey }),
                 project: ({ existingEntry }) => {
                   if (
                     !existingEntry ||
@@ -428,10 +376,12 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
                 },
               });
               persisted = persistProjection.ok;
-            } catch (err) {
-              emitCompactionEnd(false, formatErrorMessage(err));
-              throw err;
             }
+          } catch (err) {
+            emitCompactionEnd(false, formatErrorMessage(err));
+            throw err;
+          }
+          if (result.ok && result.compacted) {
             if (!persisted) {
               const reason = `Session ${key} changed before compaction completed. Retry.`;
               emitCompactionEnd(false, reason);
@@ -444,7 +394,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
               );
               return;
             }
-            recordSessionCompacted({
+            await recordSessionCompacted({
               sessionKey: target.canonicalKey,
               operationId,
               sessionId: expectedEntry.sessionId,
